@@ -1,0 +1,21 @@
+# Secrets - KHÔNG push lên Git
+.streamlit/secrets.toml
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp files
+outputs/
+frames/
+static/*.mp4
+static/*.png
+
+# HuggingFace cache
+d:/hf_cache/
+d:/torch_cache/
+
+# Environment
+.env
+*.log
