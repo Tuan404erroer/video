@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Ảnh → Video 1:1</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+
+    <div class="container">
+
+        <h1>Ảnh → Video 1:1</h1>
+
+        <p>Thiết bị: <b>{{ device }}</b></p>
+
+        <form id="render-form" method="POST" enctype="multipart/form-data">
+            <div class="upload-area" id="upload-area">
+                <input type="file" name="image" id="file-input" accept="image/*" required>
+                <div class="upload-text">
+                    <p>Chọn ảnh hoặc <strong>Ctrl+V để paste từ clipboard</strong></p>
+                    <p>Kéo thả ảnh vào đây cũng được</p>
+                </div>
+            </div>
+            <label>
+                Chế độ render
+                <select name="render_mode">
+                    <option value="locked" selected>1:1 camera êm</option>
+                    <option value="still">Tĩnh 1:1</option>
+                    <option value="redraw">AI redraw nhẹ (cần CUDA)</option>
+                    <option value="svd">AI sáng tạo (SVD)</option>
+                </select>
+            </label>
+            <button id="submit-button" type="submit">Tạo video</button>
+            <button id="cleanup-button" type="button" onclick="cleanupResources()">Giải phóng bộ nhớ</button>
+        </form>
+
+        <div id="loading" class="loading" hidden>
+            <div id="progress-message">Đang chuẩn bị...</div>
+            <progress id="progress-bar" max="100" value="0"></progress>
+        </div>
+
+        <div id="error-message" class="error" {% if not error_message %}hidden{% endif %}>
+            {{ error_message }}
+        </div>
+
+        <div id="result-block" {% if not result_video %}hidden{% endif %}>
+        <h2>Video kết quả</h2>
+
+        <video id="result-video" width="512" height="512" controls autoplay>
+            <source id="result-source" src="{{ result_video }}" type="video/mp4">
+            Trình duyệt của bạn không hỗ trợ thẻ video.
+        </video>
+
+        {% if latent_info %}
+            <p>
+                Latent shape gốc:
+                <b>{{ latent_info }}</b>
+            </p>
+        {% endif %}
+
+        <p>
+            Video đã được lưu tại:
+            <code>static/output.mp4</code>
+        </p>
+        </div>
+
+    </div>
+
+    <script>
+        const form = document.getElementById("render-form");
+        const fileInput = document.getElementById("file-input");
+        const uploadArea = document.getElementById("upload-area");
+        const submitButton = document.getElementById("submit-button");
+        const loading = document.getElementById("loading");
+        const progressMessage = document.getElementById("progress-message");
+        const progressBar = document.getElementById("progress-bar");
+        const errorMessage = document.getElementById("error-message");
+        const resultBlock = document.getElementById("result-block");
+        const resultVideo = document.getElementById("result-video");
+        const resultSource = document.getElementById("result-source");
+
+        // Paste từ clipboard
+        document.addEventListener("paste", (event) => {
+            const items = event.clipboardData?.items;
+            if (!items) return;
+
+            for (let item of items) {
+                if (item.type.startsWith("image/")) {
+                    const file = item.getAsFile();
+                    if (file) {
+                        setImageFile(file);
+                        event.preventDefault();
+                    }
+                }
+            }
+        });
+
+        // Drag & drop
+        uploadArea.addEventListener("dragover", (event) => {
+            event.preventDefault();
+            uploadArea.style.backgroundColor = "#f0f8ff";
+        });
+
+        uploadArea.addEventListener("dragleave", () => {
+            uploadArea.style.backgroundColor = "";
+        });
+
+        uploadArea.addEventListener("drop", (event) => {
+            event.preventDefault();
+            uploadArea.style.backgroundColor = "";
+            
+            const files = event.dataTransfer?.files;
+            if (files && files[0] && files[0].type.startsWith("image/")) {
+                setImageFile(files[0]);
+            }
+        });
+
+        // Click upload area
+        uploadArea.addEventListener("click", () => {
+            fileInput.click();
+        });
+
+        function setImageFile(file) {
+            // Tạo FileList mới để gán vào input
+            const dataTransfer = new DataTransfer();
+            dataTransfer.items.add(file);
+            fileInput.files = dataTransfer.files;
+            
+            // Hiển thị tên file
+            const uploadText = uploadArea.querySelector(".upload-text");
+            uploadText.innerHTML = `<p><strong>Đã chọn:</strong> ${file.name}</p>`;
+        }
+
+        async function refreshProgress() {
+            const response = await fetch("/progress", { cache: "no-store" });
+            const state = await response.json();
+            progressMessage.textContent = state.message || "Đang xử lý...";
+
+            if (state.total > 0) {
+                progressBar.value = Math.round((state.current / state.total) * 100);
+            } else {
+                progressBar.value = 0;
+            }
+        }
+
+        form.addEventListener("submit", async (event) => {
+            event.preventDefault();
+
+            loading.hidden = false;
+            errorMessage.hidden = true;
+            resultBlock.hidden = true;
+            submitButton.disabled = true;
+            progressBar.value = 0;
+            progressMessage.textContent = "Đang gửi ảnh...";
+
+            // Bước 1: Gửi ảnh → server trả về ngay, render chạy nền
+            try {
+                const startResp = await fetch("/generate", {
+                    method: "POST",
+                    body: new FormData(form)
+                });
+                const startData = await startResp.json();
+                if (!startData.ok && !startData.started) {
+                    throw new Error(startData.error || "Không thể bắt đầu render.");
+                }
+            } catch (err) {
+                errorMessage.textContent = err.message;
+                errorMessage.hidden = false;
+                loading.hidden = true;
+                submitButton.disabled = false;
+                return;
+            }
+
+            // Bước 2: Poll /progress cho đến khi done=true (không timeout)
+            progressMessage.textContent = "Đang render...";
+            const snap = await new Promise((resolve) => {
+                const poller = setInterval(async () => {
+                    try {
+                        const r = await fetch("/progress", { cache: "no-store" });
+                        const state = await r.json();
+
+                        progressMessage.textContent = state.message || "Đang xử lý...";
+                        if (state.total > 0) {
+                            progressBar.value = Math.round((state.current / state.total) * 100);
+                        }
+
+                        if (state.done) {
+                            clearInterval(poller);
+                            resolve(state);
+                        }
+                    } catch (_) {}
+                }, 700);
+            });
+
+            // Bước 3: Lấy kết quả
+            function showVideo(url) {
+                if (!url || url === "null" || url === "undefined") {
+                    errorMessage.textContent = "Render xong nhưng không tìm thấy file video.";
+                    errorMessage.hidden = false;
+                    return;
+                }
+                resultSource.src = `${url}?t=${Date.now()}`;
+                resultVideo.load();
+                resultVideo.play().catch(() => {});
+                resultBlock.hidden = false;
+            }
+
+            if (snap.error && snap.error.trim()) {
+                // Có lỗi rõ ràng
+                errorMessage.textContent = "❌ " + snap.error;
+                errorMessage.hidden = false;
+            } else if (snap.result_video) {
+                showVideo(snap.result_video);
+            } else {
+                // Fallback: gọi /result (phòng trường hợp race condition)
+                try {
+                    const r = await fetch("/result");
+                    const data = await r.json();
+                    if (data.ok && data.result_video) {
+                        showVideo(data.result_video);
+                    } else {
+                        errorMessage.textContent = "❌ " + (data.error || snap.message || "Lỗi render không rõ nguyên nhân. Xem terminal để biết chi tiết.");
+                        errorMessage.hidden = false;
+                    }
+                } catch (err) {
+                    errorMessage.textContent = "❌ " + err.message;
+                    errorMessage.hidden = false;
+                }
+            }
+
+            loading.hidden = true;
+            submitButton.disabled = false;
+        });
+
+
+
+        async function cleanupResources() {
+            try {
+                const response = await fetch("/cleanup", { method: "POST" });
+                const data = await response.json();
+                if (data.ok) {
+                    alert("✅ Đã giải phóng bộ nhớ thành công!");
+                } else {
+                    alert("❌ Lỗi cleanup: " + data.message);
+                }
+            } catch (error) {
+                alert("❌ Lỗi cleanup: " + error.message);
+            }
+        }
+    </script>
+
+</body>
+
+</html>

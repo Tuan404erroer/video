@@ -1,0 +1,11 @@
+flask
+torch
+torchvision
+diffusers>=0.28.0
+transformers
+accelerate
+Pillow
+opencv-python
+numpy
+google-genai
+toml
